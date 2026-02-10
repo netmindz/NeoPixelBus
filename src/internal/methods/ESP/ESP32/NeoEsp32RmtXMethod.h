@@ -30,6 +30,7 @@ License along with NeoPixel.  If not, see
 
 // Needed for ESP_* macros that take a log_tag
 #include "esp_log.h"
+#include "soc/soc_caps.h"
 static const char* TAG = "NeoEsp32RmtX";
 
 #include <Arduino.h>
@@ -44,8 +45,6 @@ extern "C"
 #include "driver/rmt_encoder.h"
 #include "esp_check.h"
 }
-
-static const char *TAG = "led_strip_rmt"; // TODO: Remove all TAG log stuff
 
 struct led_strip_encoder_config_t
 {
@@ -105,25 +104,56 @@ public:
         rmt_tx_channel_config_t config = {};
         config.clk_src = RMT_CLK_SRC_DEFAULT;
         config.gpio_num = static_cast<gpio_num_t>(_pin);
+        // ESP32-C5 has 48 words per RMT channel; requesting all 192 from the pool
+        // causes flush timeouts on IDF 5.5.  Use one channel block (48) instead -
+        // the driver's ping-pong encoder refills the buffer automatically.
+#if defined(CONFIG_IDF_TARGET_ESP32C5)
+        config.mem_block_symbols = SOC_RMT_MEM_WORDS_PER_CHANNEL;
+#else
         config.mem_block_symbols = 192;         // memory block size, 64 * 4 = 256 Bytes
+#endif
         config.resolution_hz = T_SPEED::RmtTicksPerSecond; // 1 MHz tick resolution, i.e., 1 tick = 1 µs
         config.trans_queue_depth = 4;           // set the number of transactions that can pend in the background
         config.flags.invert_out = T_INVERTED::Inverted;  // do not invert output signal
         config.flags.with_dma = false;          // do not need DMA backend
 
-        ret += rmt_new_tx_channel(&config, &_channel);
+        esp_err_t err = rmt_new_tx_channel(&config, &_channel);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "rmt_new_tx_channel failed: %s (pin=%u, mem=%u, res=%lu)",
+                     esp_err_to_name(err), _pin, config.mem_block_symbols, (unsigned long)config.resolution_hz);
+        }
+        ret += err;
+
         led_strip_encoder_config_t encoder_config = {};
         encoder_config.resolution = T_SPEED::RmtTicksPerSecond;
 
         _tx_config.loop_count = 0; //no loop
 
-        ret += rmt_new_led_strip_encoder(&encoder_config, &_led_encoder, T_SPEED::RmtBit0, T_SPEED::RmtBit1);
+        err = rmt_new_led_strip_encoder(&encoder_config, &_led_encoder, T_SPEED::RmtBit0, T_SPEED::RmtBit1);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "rmt_new_led_strip_encoder failed: %s", esp_err_to_name(err));
+        }
+        ret += err;
 
-        // ESP_LOGI(TAG, "Enable RMT TX channel");
-        ret += rmt_enable(_channel);
-        // if (ret) {
-        //     AddLog(2,"RMT: initialized with error code: %u on pin: %u",ret, _pin);
-        // }
+        if (_channel) {
+            err = rmt_enable(_channel);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "rmt_enable failed: %s", esp_err_to_name(err));
+            }
+            ret += err;
+        } else {
+            ESP_LOGE(TAG, "RMT channel is NULL, cannot enable");
+        }
+
+        ESP_LOGI(TAG, "Init: pin=%u mem=%u res=%lu ch=%p enc=%p ret=%d",
+                 _pin,
+#if defined(CONFIG_IDF_TARGET_ESP32C5)
+                 (unsigned)SOC_RMT_MEM_WORDS_PER_CHANNEL,
+#else
+                 192u,
+#endif
+                 (unsigned long)T_SPEED::RmtTicksPerSecond,
+                 (void*)_channel, (void*)_led_encoder, (int)ret);
     }
 
     void Update(bool maintainBufferConsistency)
@@ -135,11 +165,16 @@ public:
 
         if (ESP_OK == ESP_ERROR_CHECK_WITHOUT_ABORT(rmt_tx_wait_all_done(_channel, 10000 / portTICK_PERIOD_MS)))
         {
-            // AddLog(2,"__ %u", _sizeData);
-            // now start the RMT transmit with the editing buffer before we swap
-            // esp_err_t ret = 
-            rmt_transmit(_channel, _led_encoder, _dataEditing, _sizeData, &_tx_config); // 3 for _sizeData
-            // AddLog(2,"rmt_transmit: %u", ret);
+            rmt_transmit(_channel, _led_encoder, _dataEditing, _sizeData, &_tx_config);
+
+#if defined(CONFIG_IDF_TARGET_ESP32C5)
+            // ESP32-C5 is single-core: the main task must yield after
+            // rmt_transmit so the RMT TX_DONE ISR can run and move the
+            // completed transaction to the FreeRTOS queue.  Without this,
+            // the next rmt_tx_wait_all_done call may find an empty
+            // completion queue and report a flush timeout.
+            vTaskDelay(pdMS_TO_TICKS(2));
+#endif
             if (maintainBufferConsistency)
             {
                 // copy editing to sending,
@@ -285,7 +320,7 @@ private:
         bytes_encoder_config.bit1.val = bit1;
 
         bytes_encoder_config.flags.msb_first = 1; // WS2812 transfer bit order: G7...G0R7...R0B7...B0 - TODO: more checks
-\
+
         ESP_GOTO_ON_ERROR(rmt_new_bytes_encoder(&bytes_encoder_config, &led_encoder->bytes_encoder), err, "TEST_RMT", "create bytes encoder failed");
         ESP_GOTO_ON_ERROR(rmt_new_copy_encoder(&copy_encoder_config, &led_encoder->copy_encoder), err, "TEST_RMT", "create copy encoder failed");
 
